@@ -1,0 +1,23 @@
+ACME Cloud Solutions GmbH
+Friedrichstraße 88, 10117 Berlin, Germany
+VAT ID: DE123456789
+
+INVOICE
+
+Invoice Number: INV-2025-0042
+Invoice Date: 2025-03-14
+Currency: EUR
+
+Bill To: Globex Logistics AG, Hamburg
+
+Line Items:
+Description                        Qty   Unit Price   Line Total
+Cloud Hosting (Annual Plan)          1      1200.00      1200.00
+Premium Support Hours               10        85.00       850.00
+Data Migration Service               1       450.00       450.00
+
+Subtotal: 2500.00 EUR
+Tax (19%): 475.00 EUR
+Total: 2975.00 EUR
+
+Payment due within 30 days. Thank you for your business.

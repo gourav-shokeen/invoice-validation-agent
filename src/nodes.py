@@ -1,0 +1,389 @@
+"""Graph nodes for the Invoice Validation Agent.
+
+Each node is a function of the agent state. The LLM is only ever touched inside
+`extract`; importing this module opens no network connection and instantiates no
+model, so the deterministic validator stays trivially testable.
+
+Error policy on a live Gemini call:
+  * AUTH error (bad/blocked key)  -> raise AuthError; the run halts, no mock fallback.
+  * 404 / NOT_FOUND on the model  -> list models, fall back to a flash-tier model, retry once.
+  * Transient (429/timeout/5xx)   -> retry the same call with short backoff (not a code bug).
+"""
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+
+from .state import InvoiceData, LineItem
+from .validation import validate_invoice
+
+logger = logging.getLogger("invoice_agent")
+
+# Models to fall back to (in order) if the configured model 404s.
+_FALLBACK_MODELS = ("gemini-flash-latest", "gemini-2.0-flash", "gemini-1.5-flash")
+
+# In-code retry policy for *transient* API errors (rate limit / timeout / 5xx).
+_TRANSIENT_RETRIES = 3
+_TRANSIENT_BACKOFF = (2.0, 5.0, 10.0)
+
+SYSTEM_PROMPT = (
+    "You are an invoice data-extraction engine for an e-invoicing compliance "
+    "platform (ZUGFeRD / Factur-X, EN 16931). Extract the invoice into the "
+    "required structured schema.\n\n"
+    "CRITICAL RULES:\n"
+    "1. Transcribe every value EXACTLY as printed on the document. Copy the "
+    "numbers character-for-character.\n"
+    "2. Do NOT recompute, correct, reconcile, or 'fix' any figure. If the "
+    "printed subtotal, tax, or total do not add up, transcribe them anyway. "
+    "Downstream validation depends on capturing what the document literally "
+    "states, not what it 'should' say.\n"
+    "3. Express tax_rate as a decimal fraction (e.g. 0.19 for a 19% rate). If "
+    "no tax rate is shown, leave it null.\n"
+    "4. line_total is the per-line amount as printed; subtotal, tax_amount and "
+    "total are the document's own stated figures.\n"
+    "5. Use the currency code as printed (e.g. EUR)."
+)
+
+
+class AuthError(RuntimeError):
+    """Raised when Gemini rejects our credentials. Fatal — never retried, never mocked."""
+
+
+# --------------------------------------------------------------------------- #
+# LLM plumbing
+# --------------------------------------------------------------------------- #
+def _classify_error(exc: Exception) -> str:
+    """Bucket an exception into auth / not_found / transient / other."""
+    msg = str(exc).lower()
+    if any(t in msg for t in (
+        "api key not valid", "api_key_invalid", "invalid api key",
+        "permission denied", "permission_denied", "unauthenticated",
+        "401", "403",
+    )):
+        return "auth"
+    if any(t in msg for t in (
+        "not_found", "not found", "404",
+        "is not found for api version", "is not supported for",
+    )):
+        return "not_found"
+    if any(t in msg for t in (
+        "429", "resource_exhausted", "resourceexhausted", "rate limit",
+        "quota", "timeout", "timed out", "deadline", "503", "502", "504",
+        "unavailable", "overloaded", "internal error", "500",
+    )):
+        return "transient"
+    return "other"
+
+
+def get_llm(model: Optional[str] = None):
+    """Return a structured-output LLM (live Gemini, or the MockLLM if USE_MOCK_LLM=1)."""
+    if os.getenv("USE_MOCK_LLM", "0") == "1":
+        logger.info("USE_MOCK_LLM=1 — using deterministic MockLLM (no network).")
+        return _MockStructuredLLM()
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise AuthError("GEMINI_API_KEY is not set in the environment.")
+    llm = ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=0)
+    return llm.with_structured_output(InvoiceData)
+
+
+def _list_models_safe() -> list[str]:
+    """Best-effort listing of available Gemini models (used only on a 404 fallback)."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    # New SDK: `google-genai`
+    try:
+        from google import genai  # type: ignore
+
+        client = genai.Client(api_key=api_key)
+        names = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            actions = (
+                getattr(m, "supported_actions", None)
+                or getattr(m, "supported_generation_methods", None)
+                or []
+            )
+            if not actions or "generateContent" in actions:
+                names.append(name)
+        if names:
+            logger.info("Available models: %s", ", ".join(n.split("/")[-1] for n in names))
+            return names
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("google-genai listing unavailable: %s", exc)
+    # Legacy SDK: `google-generativeai`
+    try:
+        import google.generativeai as gga  # type: ignore
+
+        gga.configure(api_key=api_key)
+        names = [
+            m.name
+            for m in gga.list_models()
+            if "generateContent" in getattr(m, "supported_generation_methods", [])
+        ]
+        if names:
+            logger.info("Available models: %s", ", ".join(n.split("/")[-1] for n in names))
+            return names
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("google.generativeai listing unavailable: %s", exc)
+    return []
+
+
+def _pick_fallback_model(failed_model: str) -> str:
+    """Choose a flash-tier model to retry with after a 404 on `failed_model`."""
+    for name in _list_models_safe():
+        short = name.split("/")[-1]
+        if "flash" in short and short != failed_model:
+            return short
+    for candidate in _FALLBACK_MODELS:
+        if candidate != failed_model:
+            return candidate
+    return _FALLBACK_MODELS[0]
+
+
+def _build_messages(raw_text: str, prior_errors: Optional[list[str]]) -> list:
+    """Construct the extraction prompt; on a retry, fold in prior validation errors."""
+    human = (
+        "Extract the structured data from this invoice:\n\n"
+        f"<INVOICE>\n{raw_text}\n</INVOICE>"
+    )
+    if prior_errors:
+        bullets = "\n".join(f"- {e}" for e in prior_errors)
+        human += (
+            "\n\nA previous extraction FAILED deterministic validation with these "
+            f"issues:\n{bullets}\n\n"
+            "Re-examine the document and correct ONLY genuine transcription mistakes "
+            "(misread digits, wrong field mapping). Do NOT alter figures that are "
+            "printed as-is merely to make the totals reconcile — if the document "
+            "itself is inconsistent, transcribe it faithfully."
+        )
+    return [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=human)]
+
+
+def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
+    """Invoke the structured LLM with auth-stop, 404-fallback and transient-retry.
+
+    Returns (InvoiceData, model_label).
+    """
+    messages = _build_messages(raw_text, prior_errors)
+    mock = os.getenv("USE_MOCK_LLM", "0") == "1"
+    current_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    tried_fallback = False
+    attempt = 0
+
+    while True:
+        llm = get_llm(current_model)
+        try:
+            result = llm.invoke(messages)
+            if mock:
+                return result, "MockLLM"
+            logger.info("Extraction completed via Gemini model '%s'.", current_model)
+            return result, current_model
+        except Exception as exc:  # noqa: BLE001 - classified and re-raised below
+            kind = _classify_error(exc)
+            if kind == "auth":
+                raise AuthError(str(exc)) from exc
+            if kind == "not_found" and not tried_fallback and not mock:
+                fallback = _pick_fallback_model(current_model)
+                logger.warning(
+                    "Model '%s' returned NOT_FOUND (%s). Falling back to '%s'.",
+                    current_model, exc, fallback,
+                )
+                current_model = fallback
+                tried_fallback = True
+                continue
+            if kind == "transient" and attempt < _TRANSIENT_RETRIES:
+                backoff = _TRANSIENT_BACKOFF[min(attempt, len(_TRANSIENT_BACKOFF) - 1)]
+                logger.warning(
+                    "Transient API error (%s). Waiting %.0fs then retrying (%d/%d).",
+                    exc, backoff, attempt + 1, _TRANSIENT_RETRIES,
+                )
+                time.sleep(backoff)
+                attempt += 1
+                continue
+            raise
+
+
+# --------------------------------------------------------------------------- #
+# MockLLM (USE_MOCK_LLM=1) — deterministic offline parser of the sample format
+# --------------------------------------------------------------------------- #
+class _MockStructuredLLM:
+    """Deterministic stand-in for the structured Gemini client.
+
+    Parses the labelled sample-invoice format into an InvoiceData so the graph
+    can run offline (demo / CI without network). The live build-verify loop does
+    not use this path.
+    """
+
+    def invoke(self, messages: Any) -> InvoiceData:
+        return _parse_invoice_text(_messages_to_text(messages))
+
+
+def _messages_to_text(messages: Any) -> str:
+    """Flatten message(s) to a single string and return the invoice body."""
+    if isinstance(messages, str):
+        blob = messages
+    elif isinstance(messages, (list, tuple)):
+        parts = []
+        for m in messages:
+            parts.append(getattr(m, "content", m if isinstance(m, str) else str(m)))
+        blob = "\n".join(str(p) for p in parts)
+    else:
+        blob = getattr(messages, "content", str(messages))
+    match = re.search(r"<INVOICE>\s*(.*?)\s*</INVOICE>", blob, re.DOTALL)
+    return match.group(1) if match else blob
+
+
+def _parse_invoice_text(text: str) -> InvoiceData:
+    """Regex-parse the labelled sample-invoice format into InvoiceData."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    nonempty = [ln for ln in lines if ln]
+    vendor = nonempty[0] if nonempty else ""
+
+    # Labels are anchored to line starts (MULTILINE) so e.g. "Total" does not
+    # match inside "Subtotal".
+    def grab(label: str) -> str:
+        m = re.search(rf"^\s*{label}\s*:\s*(.+)", text, re.IGNORECASE | re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    def money(label: str) -> float:
+        m = re.search(
+            rf"^\s*{label}\s*:\s*[^\d-]*(-?\d+(?:[.,]\d+)?)",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        return float(m.group(1).replace(",", ".")) if m else 0.0
+
+    invoice_number = grab("Invoice Number")
+    invoice_date = grab("Invoice Date")
+    currency = grab("Currency") or "EUR"
+    subtotal = money("Subtotal")
+    total = money("Total")
+
+    tax_rate: Optional[float] = None
+    tax_amount = 0.0
+    tax_match = re.search(
+        r"^\s*Tax[^\d%]*\(?\s*(\d+(?:[.,]\d+)?)\s*%\)?\s*:?\s*[^\d-]*(-?\d+(?:[.,]\d+)?)",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if tax_match:
+        tax_rate = float(tax_match.group(1).replace(",", ".")) / 100.0
+        tax_amount = float(tax_match.group(2).replace(",", "."))
+
+    line_items: list[LineItem] = []
+    capturing = False
+    row_re = re.compile(
+        r"^(?P<desc>.*\S)\s{2,}(?P<qty>-?\d+(?:[.,]\d+)?)\s+"
+        r"(?P<price>-?\d+(?:[.,]\d+)?)\s+(?P<total>-?\d+(?:[.,]\d+)?)$"
+    )
+    for ln in lines:
+        if re.match(r"line items\s*:?\s*$", ln, re.IGNORECASE):
+            capturing = True
+            continue
+        if not capturing:
+            continue
+        if re.match(r"(subtotal|tax|total)\b", ln, re.IGNORECASE):
+            break
+        m = row_re.match(ln)
+        if m:
+            line_items.append(
+                LineItem(
+                    description=m.group("desc").strip(),
+                    quantity=float(m.group("qty").replace(",", ".")),
+                    unit_price=float(m.group("price").replace(",", ".")),
+                    line_total=float(m.group("total").replace(",", ".")),
+                )
+            )
+
+    return InvoiceData(
+        vendor=vendor,
+        invoice_number=invoice_number,
+        invoice_date=invoice_date,
+        currency=currency,
+        line_items=line_items,
+        subtotal=subtotal,
+        tax_rate=tax_rate,
+        tax_amount=tax_amount,
+        total=total,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Graph nodes
+# --------------------------------------------------------------------------- #
+def ingest(state: dict, config: RunnableConfig | None = None) -> dict:
+    """Load invoice text (from config `source_path` or pre-set raw_text); reset counters."""
+    raw_text = state.get("raw_text") or ""
+    source_path = None
+    if config:
+        source_path = (config.get("configurable") or {}).get("source_path")
+    if source_path:
+        raw_text = Path(source_path).read_text(encoding="utf-8")
+        logger.info("Ingested invoice from %s (%d chars).", source_path, len(raw_text))
+    return {
+        "raw_text": raw_text,
+        "extracted": None,
+        "validation_errors": [],
+        "status": "pending",
+        "attempts": 0,
+        "summary": "",
+    }
+
+
+def extract(state: dict) -> dict:
+    """Call the LLM to produce InvoiceData; fold prior errors in as feedback on retries."""
+    attempts = state.get("attempts", 0) + 1
+    prior_errors = state.get("validation_errors") or []
+    feedback = prior_errors if attempts > 1 else None
+    result, model_used = _invoke_llm(state["raw_text"], feedback)
+    extracted = result.model_dump() if hasattr(result, "model_dump") else dict(result)
+    logger.info("Extraction attempt %d complete (model=%s).", attempts, model_used)
+    return {"extracted": extracted, "attempts": attempts}
+
+
+def validate(state: dict) -> dict:
+    """Deterministically validate the extracted invoice (no LLM)."""
+    errors = validate_invoice(state.get("extracted"))
+    status = "valid" if not errors else "invalid"
+    logger.info("Validation found %d error(s).", len(errors))
+    return {"validation_errors": errors, "status": status}
+
+
+def finalize(state: dict) -> dict:
+    """Emit a clean success summary; status -> valid."""
+    data = state.get("extracted") or {}
+    summary = (
+        f"Invoice {data.get('invoice_number', '?')} from "
+        f"{data.get('vendor', '?')} validated successfully. "
+        f"{len(data.get('line_items', []))} line item(s); "
+        f"total {data.get('total', '?')} {data.get('currency', '')}. "
+        f"All EN 16931 consistency checks passed on attempt {state.get('attempts', 1)}."
+    )
+    return {"status": "valid", "summary": summary}
+
+
+def flag(state: dict) -> dict:
+    """Emit a human-review report listing unresolved errors; status -> flagged."""
+    errors = state.get("validation_errors") or []
+    data = state.get("extracted") or {}
+    report = [
+        "INVOICE FLAGGED FOR HUMAN REVIEW",
+        f"Invoice: {data.get('invoice_number', '?')}   Vendor: {data.get('vendor', '?')}",
+        f"Unresolved after {state.get('attempts', 0)} extraction attempt(s) — "
+        f"{len(errors)} validation issue(s):",
+    ]
+    report += [f"  - {e}" for e in errors]
+    report.append(
+        "Recommended action: a compliance reviewer should reconcile the printed "
+        "figures against source records before posting."
+    )
+    return {"status": "flagged", "summary": "\n".join(report)}

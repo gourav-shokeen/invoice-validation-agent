@@ -1,0 +1,22 @@
+Nordwind Software UG
+Karl-Liebknecht-Str. 5, 10178 Berlin, Germany
+VAT ID: DE987654321
+
+INVOICE
+
+Invoice Number: INV-2025-0099
+Invoice Date: 2025-04-02
+Currency: EUR
+
+Bill To: Initech Verwaltung GmbH, Munich
+
+Line Items:
+Description                  Qty   Unit Price   Line Total
+Consulting Services            2       30.00        60.00
+Software License Fee           1       40.00        40.00
+
+Subtotal: 100.00 EUR
+Tax (19%): 19.00 EUR
+Total: 150.00 EUR
+
+Payment due within 14 days.
