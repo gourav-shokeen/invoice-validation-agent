@@ -64,15 +64,6 @@ Mock mode runs offline with a deterministic parser, no network:
 USE_MOCK_LLM=1 python -m src.main --sample clean
 ```
 
-## Tests
-
-The tests cover the validator only and need no API key or network. pytest is the one extra dependency:
-
-```
-pip install pytest
-python -m pytest
-```
-
 ## Error handling
 
 - Rejected key: the run stops with exit code 2 and prints the error. It does not fall back to the mock.
