@@ -1,14 +1,4 @@
-"""Graph nodes for the Invoice Validation Agent.
-
-Each node is a function of the agent state. The LLM is only ever touched inside
-`extract`; importing this module opens no network connection and instantiates no
-model, so the deterministic validator stays trivially testable.
-
-Error policy on a live Gemini call:
-  * AUTH error (bad/blocked key)  -> raise AuthError; the run halts, no mock fallback.
-  * 404 / NOT_FOUND on the model  -> list models, fall back to a flash-tier model, retry once.
-  * Transient (429/timeout/5xx)   -> retry the same call with short backoff (not a code bug).
-"""
+"""Graph nodes; the LLM is only called inside extract()."""
 import logging
 import os
 import re
@@ -24,10 +14,10 @@ from .validation import validate_invoice
 
 logger = logging.getLogger("invoice_agent")
 
-# Models to fall back to (in order) if the configured model 404s.
+# fallback models if the configured one 404s
 _FALLBACK_MODELS = ("gemini-flash-latest", "gemini-2.0-flash", "gemini-1.5-flash")
 
-# In-code retry policy for *transient* API errors (rate limit / timeout / 5xx).
+# retry transient errors (429/timeout/5xx)
 _TRANSIENT_RETRIES = 3
 _TRANSIENT_BACKOFF = (2.0, 5.0, 10.0)
 
@@ -51,14 +41,10 @@ SYSTEM_PROMPT = (
 
 
 class AuthError(RuntimeError):
-    """Raised when Gemini rejects our credentials. Fatal — never retried, never mocked."""
+    """Raised when the Gemini API key is rejected."""
 
 
-# --------------------------------------------------------------------------- #
-# LLM plumbing
-# --------------------------------------------------------------------------- #
 def _classify_error(exc: Exception) -> str:
-    """Bucket an exception into auth / not_found / transient / other."""
     msg = str(exc).lower()
     if any(t in msg for t in (
         "api key not valid", "api_key_invalid", "invalid api key",
@@ -81,7 +67,6 @@ def _classify_error(exc: Exception) -> str:
 
 
 def get_llm(model: Optional[str] = None):
-    """Return a structured-output LLM (live Gemini, or the MockLLM if USE_MOCK_LLM=1)."""
     if os.getenv("USE_MOCK_LLM", "0") == "1":
         logger.info("USE_MOCK_LLM=1 — using deterministic MockLLM (no network).")
         return _MockStructuredLLM()
@@ -97,9 +82,7 @@ def get_llm(model: Optional[str] = None):
 
 
 def _list_models_safe() -> list[str]:
-    """Best-effort listing of available Gemini models (used only on a 404 fallback)."""
     api_key = os.getenv("GEMINI_API_KEY")
-    # New SDK: `google-genai`
     try:
         from google import genai  # type: ignore
 
@@ -119,7 +102,6 @@ def _list_models_safe() -> list[str]:
             return names
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("google-genai listing unavailable: %s", exc)
-    # Legacy SDK: `google-generativeai`
     try:
         import google.generativeai as gga  # type: ignore
 
@@ -138,7 +120,6 @@ def _list_models_safe() -> list[str]:
 
 
 def _pick_fallback_model(failed_model: str) -> str:
-    """Choose a flash-tier model to retry with after a 404 on `failed_model`."""
     for name in _list_models_safe():
         short = name.split("/")[-1]
         if "flash" in short and short != failed_model:
@@ -150,7 +131,6 @@ def _pick_fallback_model(failed_model: str) -> str:
 
 
 def _build_messages(raw_text: str, prior_errors: Optional[list[str]]) -> list:
-    """Construct the extraction prompt; on a retry, fold in prior validation errors."""
     human = (
         "Extract the structured data from this invoice:\n\n"
         f"<INVOICE>\n{raw_text}\n</INVOICE>"
@@ -169,10 +149,6 @@ def _build_messages(raw_text: str, prior_errors: Optional[list[str]]) -> list:
 
 
 def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
-    """Invoke the structured LLM with auth-stop, 404-fallback and transient-retry.
-
-    Returns (InvoiceData, model_label).
-    """
     messages = _build_messages(raw_text, prior_errors)
     mock = os.getenv("USE_MOCK_LLM", "0") == "1"
     current_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -212,23 +188,13 @@ def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
             raise
 
 
-# --------------------------------------------------------------------------- #
-# MockLLM (USE_MOCK_LLM=1) — deterministic offline parser of the sample format
-# --------------------------------------------------------------------------- #
+# offline stand-in used when USE_MOCK_LLM=1
 class _MockStructuredLLM:
-    """Deterministic stand-in for the structured Gemini client.
-
-    Parses the labelled sample-invoice format into an InvoiceData so the graph
-    can run offline (demo / CI without network). The live build-verify loop does
-    not use this path.
-    """
-
     def invoke(self, messages: Any) -> InvoiceData:
         return _parse_invoice_text(_messages_to_text(messages))
 
 
 def _messages_to_text(messages: Any) -> str:
-    """Flatten message(s) to a single string and return the invoice body."""
     if isinstance(messages, str):
         blob = messages
     elif isinstance(messages, (list, tuple)):
@@ -243,13 +209,11 @@ def _messages_to_text(messages: Any) -> str:
 
 
 def _parse_invoice_text(text: str) -> InvoiceData:
-    """Regex-parse the labelled sample-invoice format into InvoiceData."""
     lines = [ln.strip() for ln in text.splitlines()]
     nonempty = [ln for ln in lines if ln]
     vendor = nonempty[0] if nonempty else ""
 
-    # Labels are anchored to line starts (MULTILINE) so e.g. "Total" does not
-    # match inside "Subtotal".
+    # anchor to line start so "Total" doesn't match inside "Subtotal"
     def grab(label: str) -> str:
         m = re.search(rf"^\s*{label}\s*:\s*(.+)", text, re.IGNORECASE | re.MULTILINE)
         return m.group(1).strip() if m else ""
@@ -317,11 +281,7 @@ def _parse_invoice_text(text: str) -> InvoiceData:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Graph nodes
-# --------------------------------------------------------------------------- #
 def ingest(state: dict, config: RunnableConfig | None = None) -> dict:
-    """Load invoice text (from config `source_path` or pre-set raw_text); reset counters."""
     raw_text = state.get("raw_text") or ""
     source_path = None
     if config:
@@ -340,7 +300,6 @@ def ingest(state: dict, config: RunnableConfig | None = None) -> dict:
 
 
 def extract(state: dict) -> dict:
-    """Call the LLM to produce InvoiceData; fold prior errors in as feedback on retries."""
     attempts = state.get("attempts", 0) + 1
     prior_errors = state.get("validation_errors") or []
     feedback = prior_errors if attempts > 1 else None
@@ -351,7 +310,6 @@ def extract(state: dict) -> dict:
 
 
 def validate(state: dict) -> dict:
-    """Deterministically validate the extracted invoice (no LLM)."""
     errors = validate_invoice(state.get("extracted"))
     status = "valid" if not errors else "invalid"
     logger.info("Validation found %d error(s).", len(errors))
@@ -359,7 +317,6 @@ def validate(state: dict) -> dict:
 
 
 def finalize(state: dict) -> dict:
-    """Emit a clean success summary; status -> valid."""
     data = state.get("extracted") or {}
     summary = (
         f"Invoice {data.get('invoice_number', '?')} from "
@@ -372,7 +329,6 @@ def finalize(state: dict) -> dict:
 
 
 def flag(state: dict) -> dict:
-    """Emit a human-review report listing unresolved errors; status -> flagged."""
     errors = state.get("validation_errors") or []
     data = state.get("extracted") or {}
     report = [

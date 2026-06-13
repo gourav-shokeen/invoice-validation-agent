@@ -1,14 +1,3 @@
-"""CLI entry point for the Invoice Validation Agent.
-
-Usage:
-    python -m src.main --sample clean
-    python -m src.main --sample broken
-    python -m src.main --file path/to/invoice.txt
-
-Prints the compiled graph diagram, runs the agent against the chosen invoice,
-and pretty-prints the final state. Exit code 0 = completed run (valid OR
-flagged); 2 = the Gemini API key was rejected (fatal, no mock fallback).
-"""
 from __future__ import annotations
 
 import argparse
@@ -64,6 +53,7 @@ def _print_final_state(state: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the agent against the chosen invoice and print the final state."""
     load_dotenv()
     _configure_logging()
 
@@ -81,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
 
     source = _resolve_source(args)
 
-    # Imported here so `--help` and arg errors never require LangChain/LangGraph.
+    # defer heavy imports so --help and argparse errors stay fast
     from .graph import build_graph
     from .nodes import AuthError
 

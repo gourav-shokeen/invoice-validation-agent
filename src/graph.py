@@ -1,10 +1,3 @@
-"""LangGraph wiring for the Invoice Validation Agent.
-
-    START -> ingest -> extract -> validate -> (router)
-        no errors                          -> finalize -> END
-        errors AND attempts <  MAX_ATTEMPTS -> extract   (self-correction CYCLE)
-        errors AND attempts >= MAX_ATTEMPTS -> flag     -> END
-"""
 from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
@@ -12,12 +5,11 @@ from langgraph.graph import END, START, StateGraph
 from .nodes import extract, finalize, flag, ingest, validate
 from .state import AgentState
 
-# Maximum number of extraction attempts before the invoice is flagged.
+# extraction attempts before flagging
 MAX_ATTEMPTS = 2
 
 
 def route_after_validate(state: AgentState) -> str:
-    """Conditional router: continue to finalize, retry extraction, or flag."""
     if not state.get("validation_errors"):
         return "finalize"
     if state.get("attempts", 0) < MAX_ATTEMPTS:

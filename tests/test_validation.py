@@ -1,8 +1,3 @@
-"""Unit tests for the deterministic invoice validator.
-
-These exercise `validate_invoice` only — no API, no LLM, USE_MOCK_LLM not even
-needed. The validator imports only the standard library.
-"""
 from __future__ import annotations
 
 import copy
@@ -11,7 +6,6 @@ from src.validation import TOLERANCE, validate_invoice
 
 
 def consistent_invoice() -> dict:
-    """A fully consistent invoice (19% German VAT) that must pass with zero errors."""
     return {
         "vendor": "ACME Cloud Solutions GmbH",
         "invoice_number": "INV-2025-0042",
@@ -30,7 +24,6 @@ def consistent_invoice() -> dict:
 
 
 def broken_invoice() -> dict:
-    """Printed totals are internally inconsistent: 100 + 19 != 150."""
     return {
         "vendor": "Nordwind Software UG",
         "invoice_number": "INV-2025-0099",
@@ -60,7 +53,7 @@ def test_broken_invoice_flags_total_mismatch():
 
 def test_within_tolerance_passes():
     inv = consistent_invoice()
-    # Nudge the total by less than one cent — must still pass.
+    # within tolerance, still passes
     inv["total"] = inv["total"] + (TOLERANCE / 2)
     assert validate_invoice(inv) == []
 
@@ -83,8 +76,7 @@ def test_empty_currency_flagged():
 
 def test_line_items_do_not_sum_to_subtotal():
     inv = consistent_invoice()
-    # Line items now sum to 2299, but subtotal/tax/total stay consistent at 2500/475/2975,
-    # so only the line-sum check should fire.
+    # only the line-sum check should fire
     inv["line_items"][0]["line_total"] = 999.0
     errors = validate_invoice(inv)
     assert len(errors) == 1
@@ -93,7 +85,7 @@ def test_line_items_do_not_sum_to_subtotal():
 
 def test_tax_rate_mismatch():
     inv = consistent_invoice()
-    # Keep subtotal+tax == total so only the tax-rate check fails.
+    # keep subtotal+tax == total so only the tax check fails
     inv["subtotal"] = 100.0
     inv["tax_amount"] = 25.0
     inv["total"] = 125.0
@@ -130,7 +122,7 @@ def test_multiple_errors_accumulate():
         "total": -10.0,
     }
     errors = validate_invoice(inv)
-    # At least: vendor, invoice_number, invoice_date, total, currency, 2 negatives.
+    # missing fields, currency, and negatives
     assert len(errors) >= 6
 
 

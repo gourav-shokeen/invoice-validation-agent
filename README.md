@@ -1,107 +1,88 @@
 # Invoice Validation Agent
 
-A LangGraph state-machine agent that extracts structured data from an invoice and validates its internal arithmetic, with an LLM self-correction cycle and a human-review fallback.
+Extracts structured data from an invoice with an LLM and checks that the figures printed on the document are internally consistent.
 
 ## Context
 
-E-invoicing standards such as **ZUGFeRD / Factur-X** (the German/French hybrid PDF+XML formats built on the European **EN 16931** semantic model) require that an invoice's stated figures be internally consistent — line items must sum to the net, and net plus tax must equal the gross. This agent demonstrates that compliance step: it transcribes an invoice exactly as printed and then runs deterministic checks to decide whether the document can be posted automatically or must be escalated for human review. Crucially, it validates *what the document actually says* — it never silently "fixes" a wrong total.
+E-invoicing formats like ZUGFeRD and Factur-X are built on the EN 16931 data model, which requires an invoice's numbers to add up: line items sum to the net, and net plus tax equals the gross. This tool runs that check. It transcribes an invoice exactly as printed and then validates the arithmetic, so it can decide whether a document is safe to post automatically or needs a human to look at it. It does not correct wrong totals — an inconsistent document is reported, not silently fixed.
 
 ## Architecture
 
-The agent is an explicit `StateGraph` (not a prebuilt ReAct agent) with a conditional branch and a self-correction cycle.
+A LangGraph `StateGraph` with a deterministic validation step and a retry loop:
 
 ```
-START → ingest → extract → validate ─┬─ (no errors) ──────────────→ finalize → END
-                    ▲                │
-                    │                ├─ (errors, attempts < MAX) ──→ extract   ← CYCLE
-                    └────────────────┘
-                                     └─ (errors, attempts ≥ MAX) ──→ flag     → END
+ingest -> extract -> validate
+                       |
+                       |-- no errors ............. finalize  (status: valid)
+                       |-- errors, attempts < 2 ... back to extract
+                       |-- errors, attempts >= 2 .. flag      (status: flagged)
 ```
 
-| Node | Responsibility |
-|------|----------------|
-| `ingest` | Load invoice text into `raw_text`; reset `attempts`/`status`. |
-| `extract` | Call Gemini via `.with_structured_output(InvoiceData)` to transcribe fields **exactly as printed** (no recomputation). On a retry, the prior validation errors are folded into the prompt as feedback. Increments `attempts`. |
-| `validate` | **Deterministic, no LLM.** Checks required fields, line-item sum vs. subtotal, subtotal + tax vs. total, tax_amount vs. subtotal × tax_rate, non-empty currency, and no negative amounts. |
-| `finalize` | Emit clean JSON + a success summary; `status = "valid"`. |
-| `flag` | Emit a human-review report listing unresolved errors; `status = "flagged"`. |
+- `ingest` reads the invoice text and resets the run counters.
+- `extract` calls Gemini with `with_structured_output(InvoiceData)` and transcribes the fields as printed. On a retry it feeds the previous validation errors back to the model.
+- `validate` runs deterministically, no LLM: required fields present, line items sum to the subtotal, subtotal + tax equals the total, tax equals subtotal * rate, currency present, no negative amounts.
+- `finalize` writes a short summary and sets status to `valid`.
+- `flag` writes a human-review report and sets status to `flagged`.
 
-The router after `validate` is the decision point: no errors → `finalize`; errors with attempts remaining → back to `extract` (the **cycle**); errors with attempts exhausted (`MAX_ATTEMPTS = 2`) → `flag`.
-
-**State** (`src/state.py`): `raw_text`, `extracted`, `validation_errors`, `status`, `attempts`, `summary`. The Pydantic `InvoiceData` schema captures vendor, invoice number/date, currency, line items, subtotal, tax_rate, tax_amount, and total.
-
-### Sample behaviour
-
-- `samples/clean_invoice.txt` — math is internally consistent (line items sum to subtotal; subtotal + 19% VAT = total). Faithful extraction → passes validation → **finalize**.
-- `samples/broken_invoice.txt` — the printed figures are deliberately inconsistent (Subtotal 100.00, Tax 19.00, Total 150.00). Faithful extraction records `total = 150`, the validator catches `subtotal + tax ≠ total`, the cycle retries up to `MAX_ATTEMPTS`, and the invoice is **flagged**.
+The router after `validate` sends a clean invoice to `finalize`. If there are errors it loops back to `extract` up to `MAX_ATTEMPTS` (2), then routes to `flag`. The state passed between nodes (`src/state.py`) holds the raw text, the extracted dict, the validation errors, the status, the attempt count, and the summary.
 
 ## Setup
 
-Requires Python 3.11+. Using [`uv`](https://github.com/astral-sh/uv) (recommended):
+Python 3.11 or newer.
 
-```bash
-uv venv --python 3.12 .venv
-source .venv/bin/activate
-uv pip install -r requirements.txt          # runtime deps
-uv pip install -r requirements-dev.txt      # + pytest
 ```
-
-Or with stdlib `venv`:
-
-```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 ```
 
-Configure secrets — copy `.env.example` to `.env` and set your key:
+Copy `.env.example` to `.env` and set your key:
 
-```bash
-cp .env.example .env
-# edit .env:
-#   GEMINI_API_KEY=your-key-here
-#   GEMINI_MODEL=gemini-2.5-flash
-#   USE_MOCK_LLM=0
+```
+GEMINI_API_KEY=your-key
+GEMINI_MODEL=gemini-2.5-flash
+USE_MOCK_LLM=0
 ```
 
-`.env` is git-ignored and must never be committed.
+`.env` is git-ignored.
 
 ## Run
 
-Live mode (calls the Gemini API — the default):
+Live mode calls Gemini:
 
-```bash
-python -m src.main --sample clean     # consistent invoice → status "valid"
-python -m src.main --sample broken     # inconsistent invoice → status "flagged"
+```
+python -m src.main --sample clean      # consistent invoice, ends valid
+python -m src.main --sample broken     # inconsistent invoice, ends flagged
 python -m src.main --file path/to/invoice.txt
 ```
 
-Each run prints the compiled graph diagram (mermaid), then the final state: status, extracted JSON, validation errors, and a summary. Exit code `0` means the run completed (valid **or** flagged); exit code `2` means the Gemini key was rejected.
+Each run prints the compiled graph diagram, then the final state: status, extracted JSON, validation errors, and summary. Exit code 0 means the run completed (valid or flagged); exit code 2 means the API key was rejected.
 
-Offline / mock mode (deterministic, no network — useful for demos or CI):
+Mock mode runs offline with a deterministic parser, no network:
 
-```bash
+```
 USE_MOCK_LLM=1 python -m src.main --sample clean
 ```
 
 ## Tests
 
-The unit tests cover the deterministic validator only — no API key or network required:
+The tests cover the validator only and need no API key or network. pytest is the one extra dependency:
 
-```bash
-pytest                # or: python -m pytest -v
+```
+pip install pytest
+python -m pytest
 ```
 
 ## Error handling
 
-- **Auth failure** (invalid/blocked key) → the run halts immediately with exit code 2 and reports the exact error. It never falls back to mock.
-- **Model 404 / NOT_FOUND** → the agent lists available models, falls back to a flash-tier model, retries once, and logs which model was used.
-- **Transient errors** (429 / timeout / 5xx) → retried in place with short backoff; these are not treated as extraction attempts.
+- Rejected key: the run stops with exit code 2 and prints the error. It does not fall back to the mock.
+- Unknown model name (404): lists available models, retries once on a flash-tier model, and logs the model used.
+- Transient errors (429, timeout, 5xx): retried with backoff and not counted as extraction attempts.
 
-## Future Enhancements
+## Future work
 
-- **ZUGFeRD / Factur-X XML export** — emit a validated EN 16931 CII XML alongside the JSON, and ingest the embedded XML directly from PDF/A-3 invoices.
-- **Batch processing** — fan out across an invoice folder or queue with per-document status reporting.
-- **Per-field confidence scores** — surface extraction confidence so reviewers can prioritise low-certainty fields.
-- **Human-in-the-loop approval gate** — pause flagged invoices on an interrupt and resume after a reviewer's decision (LangGraph checkpointer + `interrupt`).
-- **ERP push** — post validated invoices to an accounting/ERP system (e.g. DATEV, SAP) on success.
+- ZUGFeRD / Factur-X XML export: emit EN 16931 CII XML next to the JSON, and read embedded XML from PDF/A-3 invoices.
+- Batch processing over a folder or queue.
+- Per-field confidence scores.
+- Human-in-the-loop approval gate using a LangGraph checkpointer and interrupt.
+- Push validated invoices to an ERP such as DATEV or SAP.
