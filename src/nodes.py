@@ -1,15 +1,14 @@
 """Graph nodes; the LLM is only called inside extract()."""
 import logging
 import os
-import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from .state import InvoiceData, LineItem
+from .state import InvoiceData
 from .validation import validate_invoice
 
 logger = logging.getLogger("invoice_agent")
@@ -67,10 +66,6 @@ def _classify_error(exc: Exception) -> str:
 
 
 def get_llm(model: Optional[str] = None):
-    if os.getenv("USE_MOCK_LLM", "0") == "1":
-        logger.info("USE_MOCK_LLM=1 — using deterministic MockLLM (no network).")
-        return _MockStructuredLLM()
-
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -150,7 +145,6 @@ def _build_messages(raw_text: str, prior_errors: Optional[list[str]]) -> list:
 
 def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
     messages = _build_messages(raw_text, prior_errors)
-    mock = os.getenv("USE_MOCK_LLM", "0") == "1"
     current_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     tried_fallback = False
     attempt = 0
@@ -159,15 +153,13 @@ def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
         llm = get_llm(current_model)
         try:
             result = llm.invoke(messages)
-            if mock:
-                return result, "MockLLM"
             logger.info("Extraction completed via Gemini model '%s'.", current_model)
             return result, current_model
         except Exception as exc:  # noqa: BLE001 - classified and re-raised below
             kind = _classify_error(exc)
             if kind == "auth":
                 raise AuthError(str(exc)) from exc
-            if kind == "not_found" and not tried_fallback and not mock:
+            if kind == "not_found" and not tried_fallback:
                 fallback = _pick_fallback_model(current_model)
                 logger.warning(
                     "Model '%s' returned NOT_FOUND (%s). Falling back to '%s'.",
@@ -186,99 +178,6 @@ def _invoke_llm(raw_text: str, prior_errors: Optional[list[str]]):
                 attempt += 1
                 continue
             raise
-
-
-# offline stand-in used when USE_MOCK_LLM=1
-class _MockStructuredLLM:
-    def invoke(self, messages: Any) -> InvoiceData:
-        return _parse_invoice_text(_messages_to_text(messages))
-
-
-def _messages_to_text(messages: Any) -> str:
-    if isinstance(messages, str):
-        blob = messages
-    elif isinstance(messages, (list, tuple)):
-        parts = []
-        for m in messages:
-            parts.append(getattr(m, "content", m if isinstance(m, str) else str(m)))
-        blob = "\n".join(str(p) for p in parts)
-    else:
-        blob = getattr(messages, "content", str(messages))
-    match = re.search(r"<INVOICE>\s*(.*?)\s*</INVOICE>", blob, re.DOTALL)
-    return match.group(1) if match else blob
-
-
-def _parse_invoice_text(text: str) -> InvoiceData:
-    lines = [ln.strip() for ln in text.splitlines()]
-    nonempty = [ln for ln in lines if ln]
-    vendor = nonempty[0] if nonempty else ""
-
-    # anchor to line start so "Total" doesn't match inside "Subtotal"
-    def grab(label: str) -> str:
-        m = re.search(rf"^\s*{label}\s*:\s*(.+)", text, re.IGNORECASE | re.MULTILINE)
-        return m.group(1).strip() if m else ""
-
-    def money(label: str) -> float:
-        m = re.search(
-            rf"^\s*{label}\s*:\s*[^\d-]*(-?\d+(?:[.,]\d+)?)",
-            text,
-            re.IGNORECASE | re.MULTILINE,
-        )
-        return float(m.group(1).replace(",", ".")) if m else 0.0
-
-    invoice_number = grab("Invoice Number")
-    invoice_date = grab("Invoice Date")
-    currency = grab("Currency") or "EUR"
-    subtotal = money("Subtotal")
-    total = money("Total")
-
-    tax_rate: Optional[float] = None
-    tax_amount = 0.0
-    tax_match = re.search(
-        r"^\s*Tax[^\d%]*\(?\s*(\d+(?:[.,]\d+)?)\s*%\)?\s*:?\s*[^\d-]*(-?\d+(?:[.,]\d+)?)",
-        text,
-        re.IGNORECASE | re.MULTILINE,
-    )
-    if tax_match:
-        tax_rate = float(tax_match.group(1).replace(",", ".")) / 100.0
-        tax_amount = float(tax_match.group(2).replace(",", "."))
-
-    line_items: list[LineItem] = []
-    capturing = False
-    row_re = re.compile(
-        r"^(?P<desc>.*\S)\s{2,}(?P<qty>-?\d+(?:[.,]\d+)?)\s+"
-        r"(?P<price>-?\d+(?:[.,]\d+)?)\s+(?P<total>-?\d+(?:[.,]\d+)?)$"
-    )
-    for ln in lines:
-        if re.match(r"line items\s*:?\s*$", ln, re.IGNORECASE):
-            capturing = True
-            continue
-        if not capturing:
-            continue
-        if re.match(r"(subtotal|tax|total)\b", ln, re.IGNORECASE):
-            break
-        m = row_re.match(ln)
-        if m:
-            line_items.append(
-                LineItem(
-                    description=m.group("desc").strip(),
-                    quantity=float(m.group("qty").replace(",", ".")),
-                    unit_price=float(m.group("price").replace(",", ".")),
-                    line_total=float(m.group("total").replace(",", ".")),
-                )
-            )
-
-    return InvoiceData(
-        vendor=vendor,
-        invoice_number=invoice_number,
-        invoice_date=invoice_date,
-        currency=currency,
-        line_items=line_items,
-        subtotal=subtotal,
-        tax_rate=tax_rate,
-        tax_amount=tax_amount,
-        total=total,
-    )
 
 
 def ingest(state: dict, config: RunnableConfig | None = None) -> dict:

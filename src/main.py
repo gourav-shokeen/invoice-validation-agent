@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except AuthError as exc:
         print("\n" + "!" * 70)
-        print("FATAL: the Gemini API key was REJECTED. Halting — no mock fallback.")
+        print("FATAL: Gemini authentication/configuration failed. Halting.")
         print(f"Exact error: {exc}")
         print("!" * 70)
         return 2
